@@ -24,6 +24,7 @@
  * Usage:
  * - `/agent` — Show selector to switch agents
  * - `/agent <name>` — Switch to agent directly
+ * - `/agent-search <query>` — Search agents by name, description, or body
  * - `Ctrl+Shift+A` — Cycle through available agents
  * - Set default in `.pi/settings.json`: `{ "defaultAgent": "planner" }`
  * - Agent runs inline (same process) with full streaming visibility
@@ -54,6 +55,13 @@ interface Settings {
 interface OriginalState {
 	model: Model<Api> | undefined;
 	tools: string[];
+}
+
+interface SearchResult {
+	name: string;
+	agent: AgentDefinition;
+	score: number;
+	snippets: string[];
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -163,6 +171,98 @@ function parseModelRef(ref: string): { provider: string; modelId: string } | und
 	};
 }
 
+// ─── Search Helpers ──────────────────────────────────────────────────────────
+
+/**
+ * Calculate search relevance score for an agent.
+ * Higher score = better match.
+ */
+function scoreAgent(agent: AgentDefinition, query: string): number {
+	const q = query.toLowerCase();
+	let score = 0;
+
+	// Exact name match (highest priority)
+	if (agent.name.toLowerCase() === q) score += 100;
+	// Name contains query
+	else if (agent.name.toLowerCase().includes(q)) score += 50;
+
+	// Description match
+	if (agent.description?.toLowerCase().includes(q)) score += 30;
+
+	// Model match
+	if (agent.model?.toLowerCase().includes(q)) score += 20;
+
+	// Tools match
+	if (agent.tools?.some((t) => t.toLowerCase().includes(q))) score += 15;
+
+	// Body content match
+	const bodyLower = agent.body.toLowerCase();
+	const bodyMatches = (bodyLower.match(new RegExp(q, "g")) || []).length;
+	score += Math.min(bodyMatches * 5, 25); // Cap body score
+
+	return score;
+}
+
+/**
+ * Extract context snippets around query matches in text.
+ */
+function extractSnippets(text: string, query: string, maxSnippets = 2, snippetLength = 40): string[] {
+	const q = query.toLowerCase();
+	const lower = text.toLowerCase();
+	const snippets: string[] = [];
+	let pos = 0;
+
+	while (pos < lower.length && snippets.length < maxSnippets) {
+		const idx = lower.indexOf(q, pos);
+		if (idx === -1) break;
+
+		const start = Math.max(0, idx - snippetLength);
+		const end = Math.min(text.length, idx + q.length + snippetLength);
+		let snippet = text.slice(start, end);
+
+		// Add ellipsis
+		if (start > 0) snippet = "…" + snippet;
+		if (end < text.length) snippet = snippet + "…";
+
+		// Highlight match
+		const matchStart = start > 0 ? 1 : 0;
+		snippet = snippet.slice(0, matchStart + idx - start) +
+			"**" + snippet.slice(matchStart + idx - start, matchStart + idx - start + q.length) + "**" +
+			snippet.slice(matchStart + idx - start + q.length);
+
+		snippets.push(snippet.replace(/\n/g, " "));
+		pos = idx + q.length;
+	}
+
+	return snippets;
+}
+
+/**
+ * Search agents and return ranked results.
+ */
+function searchAgents(
+	agents: Map<string, AgentDefinition>,
+	query: string,
+	minScore = 1,
+): SearchResult[] {
+	if (!query.trim()) return [];
+
+	const results: SearchResult[] = [];
+	for (const [name, agent] of agents) {
+		const score = scoreAgent(agent, query);
+		if (score >= minScore) {
+			const snippets: string[] = [];
+			if (agent.description) {
+				snippets.push(...extractSnippets(agent.description, query, 1, 30));
+			}
+			snippets.push(...extractSnippets(agent.body, query, 2, 35));
+			results.push({ name, agent, score, snippets });
+		}
+	}
+
+	return results.sort((a, b) => b.score - a.score);
+}
+
 // ─── Extension ───────────────────────────────────────────────────────────────
 
 export default function agentModeExtension(pi: ExtensionAPI) {
@@ -249,6 +349,84 @@ export default function agentModeExtension(pi: ExtensionAPI) {
 	}
 
 	/**
+	 * Render a generic agent selector UI with the given items and header.
+	 */
+	async function showAgentPicker(
+		ctx: ExtensionContext,
+		items: SelectItem[],
+		headerText: string,
+		maxVisible: number,
+	): Promise<string | null> {
+		return ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+			const container = new Container();
+			container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
+
+			// Header
+			container.addChild(new Text(theme.fg("accent", theme.bold(headerText))));
+
+			// SelectList with themed styling
+			const selectList = new SelectList(items, Math.min(items.length, maxVisible), {
+				selectedPrefix: (text: string) => theme.fg("accent", text),
+				selectedText: (text: string) => theme.fg("accent", text),
+				description: (text: string) => theme.fg("muted", text),
+				scrollInfo: (text: string) => theme.fg("dim", text),
+				noMatch: (text: string) => theme.fg("warning", text),
+			});
+
+			selectList.onSelect = (item) => done(item.value);
+			selectList.onCancel = () => done(null);
+
+			container.addChild(selectList);
+
+			// Footer hint
+			container.addChild(new Text(theme.fg("dim", "↑↓ navigate • enter select • esc cancel")));
+
+			container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
+
+			return {
+				render(width: number) {
+					return container.render(width);
+				},
+				invalidate() {
+					container.invalidate();
+				},
+				handleInput(data: string) {
+					selectList.handleInput(data);
+					tui.requestRender();
+				},
+			};
+		});
+	}
+
+	/**
+	 * Handle the result of an agent selection.
+	 */
+	async function handleAgentSelection(ctx: ExtensionContext, result: string | null): Promise<void> {
+		if (!result) return;
+
+		if (result === "(none)") {
+			activeAgentName = undefined;
+			activeAgent = undefined;
+			if (originalState) {
+				if (originalState.model) {
+					await pi.setModel(originalState.model);
+				}
+				pi.setActiveTools(originalState.tools);
+			}
+			ctx.ui.notify("Agent cleared, defaults restored", "info");
+			updateStatus(ctx);
+			return;
+		}
+
+		const agent = agents.get(result);
+		if (agent) {
+			await applyAgent(result, agent, ctx);
+			/* agent activated silently */
+			updateStatus(ctx);
+		}
+	}
+
+	/**
 	 * Show agent selector UI.
 	 */
 	async function showAgentSelector(ctx: ExtensionContext): Promise<void> {
@@ -280,69 +458,36 @@ export default function agentModeExtension(pi: ExtensionAPI) {
 			description: "Clear active agent, restore defaults",
 		});
 
-		const result = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
-			const container = new Container();
-			container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
+		const result = await showAgentPicker(ctx, items, "Select Agent", 10);
+		await handleAgentSelection(ctx, result);
+	}
 
-			// Header
-			container.addChild(new Text(theme.fg("accent", theme.bold("Select Agent"))));
+	/**
+	 * Show search results UI with selectable agents.
+	 */
+	async function showSearchResults(ctx: ExtensionContext, query: string): Promise<void> {
+		const results = searchAgents(agents, query);
 
-			// SelectList with themed styling
-			const selectList = new SelectList(items, Math.min(items.length, 10), {
-				selectedPrefix: (text: string) => theme.fg("accent", text),
-				selectedText: (text: string) => theme.fg("accent", text),
-				description: (text: string) => theme.fg("muted", text),
-				scrollInfo: (text: string) => theme.fg("dim", text),
-				noMatch: (text: string) => theme.fg("warning", text),
-			});
-
-			selectList.onSelect = (item) => done(item.value);
-			selectList.onCancel = () => done(null);
-
-			container.addChild(selectList);
-
-			// Footer hint
-			container.addChild(new Text(theme.fg("dim", "↑↓ navigate • enter select • esc cancel")));
-
-			container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
-
-			return {
-				render(width: number) {
-					return container.render(width);
-				},
-				invalidate() {
-					container.invalidate();
-				},
-				handleInput(data: string) {
-					selectList.handleInput(data);
-					tui.requestRender();
-				},
-			};
-		});
-
-		if (!result) return;
-
-		if (result === "(none)") {
-			// Clear agent and restore original state
-			activeAgentName = undefined;
-			activeAgent = undefined;
-			if (originalState) {
-				if (originalState.model) {
-					await pi.setModel(originalState.model);
-				}
-				pi.setActiveTools(originalState.tools);
-			}
-			ctx.ui.notify("Agent cleared, defaults restored", "info");
-			updateStatus(ctx);
+		if (results.length === 0) {
+			ctx.ui.notify(`No agents found matching "${query}"`, "warning");
 			return;
 		}
 
-		const agent = agents.get(result);
-		if (agent) {
-			await applyAgent(result, agent, ctx);
-			/* agent activated silently */
-			updateStatus(ctx);
-		}
+		// Build select items from search results
+		const items: SelectItem[] = results.map((result) => {
+			const isActive = result.name === activeAgentName;
+			const snippetText = result.snippets.length > 0
+				? result.snippets[0].slice(0, 80)
+				: buildAgentDescription(result.agent);
+			return {
+				value: result.name,
+				label: isActive ? `${result.name} (active) [score: ${result.score}]` : `${result.name} [score: ${result.score}]`,
+				description: snippetText,
+			};
+		});
+
+		const result = await showAgentPicker(ctx, items, `Search Results: "${query}" (${results.length} found)`, 8);
+		await handleAgentSelection(ctx, result);
 	}
 
 	/**
@@ -499,6 +644,24 @@ export default function agentModeExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	// Register /agent-search command to search agents
+	pi.registerCommand("agent-search", {
+		description: "Search agents by name, description, or body content",
+		handler: async (args, ctx) => {
+			// If query provided, search directly
+			if (args?.trim()) {
+				await showSearchResults(ctx, args.trim());
+				return;
+			}
+
+			// Otherwise prompt for search query
+			const query = await ctx.ui.input("Search agents:", "name, description, or content");
+			if (query?.trim()) {
+				await showSearchResults(ctx, query.trim());
+			}
+		},
+	});
+
 	// ─── Tool Registration ──────────────────────────────────────────────────────
 
 	// Register set_agent tool for autonomous switching
@@ -531,6 +694,59 @@ export default function agentModeExtension(pi: ExtensionAPI) {
 			return {
 				content: [{ type: "text", text: msg }],
 				details: { agent: name, reason },
+			};
+		},
+	});
+
+	// Register search_agents tool for programmatic search
+	pi.registerTool({
+		name: "search_agents",
+		label: "Search Agents",
+		description: "Search available agents by name, description, or body content. Returns ranked results with relevance scores and matching snippets.",
+		parameters: Type.Object({
+			query: Type.String({ description: "Search query to match against agent name, description, or body content" }),
+			limit: Type.Optional(Type.Number({ description: "Maximum number of results to return (default: 5)" })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			const { query, limit = 5 } = params;
+			const results = searchAgents(agents, query);
+			const topResults = results.slice(0, limit);
+
+			if (topResults.length === 0) {
+				return {
+					content: [{ type: "text", text: `No agents found matching "${query}".` }],
+					details: { query, results: [] },
+				};
+			}
+
+			const lines = topResults.map((r, i) => {
+				const isActive = r.name === activeAgentName ? " [ACTIVE]" : "";
+				let line = `${i + 1}. ${r.name}${isActive} (score: ${r.score})`;
+				if (r.agent.description) line += `\n   Description: ${r.agent.description}`;
+				if (r.agent.model) line += `\n   Model: ${r.agent.model}`;
+				if (r.agent.tools) line += `\n   Tools: ${r.agent.tools.join(", ")}`;
+				if (r.snippets.length > 0) {
+					line += `\n   Matches: ${r.snippets.slice(0, 2).join(" | ")}`;
+				}
+				return line;
+			});
+
+			const text = `Found ${results.length} agent(s) matching "${query}" (showing top ${topResults.length}):\n\n${lines.join("\n\n")}`;
+
+			return {
+				content: [{ type: "text", text }],
+				details: {
+					query,
+					totalResults: results.length,
+					results: topResults.map((r) => ({
+						name: r.name,
+						score: r.score,
+						description: r.agent.description,
+						model: r.agent.model,
+						tools: r.agent.tools,
+						snippets: r.snippets,
+					})),
+				},
 			};
 		},
 	});
