@@ -11,6 +11,7 @@ Define agents as markdown files with YAML frontmatter, select a default agent, a
 - **Keyboard cycling** — `Ctrl+Shift+M` to cycle agents
 - **Visual indicator** — Widget banner above editor shows active agent
 - **Model & tool restriction** — Per-agent model and tool sets
+- **Agent search** — `/agent-search <query>` to find agents by name, description, or body content
 - **Autonomous switching** — `set_agent` tool for LLM-driven switches
 - **Session persistence** — Active agent survives session resume
 
@@ -69,6 +70,7 @@ The markdown body after frontmatter becomes the agent's system prompt instructio
 - `/agent <name>` — Switch directly to an agent
 - `/agent clear` — Clear active agent, restore defaults
 - `/agents` — List all available agents
+- `/agent-search <query>` — Search agents by name, description, or body content
 
 ### Keyboard
 
@@ -100,6 +102,19 @@ The LLM can call the `set_agent` tool to switch agents programmatically:
   "reason": "Planning complete, switching to implementation"
 }
 ```
+
+### Searching Agents
+
+The LLM can search for agents by content using the `search_agents` tool:
+
+```json
+{
+  "query": "planning",
+  "limit": 5
+}
+```
+
+This searches agent names, descriptions, models, tools, and body content, returning ranked results with relevance scores.
 
 ## How It Works vs Subagents
 
