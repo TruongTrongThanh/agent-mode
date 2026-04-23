@@ -1,0 +1,616 @@
+/**
+ * Agent Mode Extension
+ *
+ * OpenCode-style default agent system for PI. Define agents as markdown files
+ * with YAML frontmatter, select a default agent, and have all prompts processed
+ * through that agent with full real-time visibility.
+ *
+ * Agent definitions (merged, project overrides global):
+ * - ~/.pi/agent/agents/*.md (global)
+ * - <cwd>/.pi/agents/*.md (project-local)
+ *
+ * Example agent file (e.g., ~/.pi/agent/agents/planner.md):
+ * ```markdown
+ * ---
+ * name: planner
+ * description: Planning specialist
+ * model: anthropic/claude-sonnet-4-5
+ * tools: read, bash, grep, find, ls
+ * ---
+ * You are a planning specialist. Create detailed plans before implementation.
+ * Focus on understanding requirements fully before proposing solutions.
+ * ```
+ *
+ * Usage:
+ * - `/agent` — Show selector to switch agents
+ * - `/agent <name>` — Switch to agent directly
+ * - `Ctrl+Shift+A` — Cycle through available agents
+ * - Set default in `.pi/settings.json`: `{ "defaultAgent": "planner" }`
+ * - Agent runs inline (same process) with full streaming visibility
+ */
+
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import type { Api, Model } from "@mariozechner/pi-ai";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { DynamicBorder, getAgentDir } from "@mariozechner/pi-coding-agent";
+import { Container, Key, type SelectItem, SelectList, Text } from "@mariozechner/pi-tui";
+import { Type } from "typebox";
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+
+interface AgentDefinition {
+	name: string;
+	description?: string;
+	model?: string;
+	tools?: string[];
+	body: string;
+}
+
+interface Settings {
+	defaultAgent?: string;
+}
+
+interface OriginalState {
+	model: Model<Api> | undefined;
+	tools: string[];
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function loadSettings(cwd: string): Settings {
+	const globalPath = join(getAgentDir(), "settings.json");
+	const projectPath = join(cwd, ".pi", "settings.json");
+
+	let settings: Settings = {};
+
+	for (const path of [globalPath, projectPath]) {
+		if (existsSync(path)) {
+			try {
+				const content = readFileSync(path, "utf-8");
+				const parsed = JSON.parse(content) as Settings;
+				settings = { ...settings, ...parsed };
+			} catch {
+				/* ignore invalid json */
+			}
+		}
+	}
+
+	return settings;
+}
+
+function findAgentFiles(...dirs: string[]): string[] {
+	const files: string[] = [];
+	for (const dir of dirs) {
+		if (!existsSync(dir)) continue;
+		for (const entry of readdirSync(dir, { withFileTypes: true })) {
+			if (entry.isFile() && entry.name.endsWith(".md")) {
+				files.push(join(dir, entry.name));
+			}
+		}
+	}
+	return files;
+}
+
+function parseAgentFile(filePath: string): AgentDefinition | undefined {
+	const content = readFileSync(filePath, "utf-8");
+
+	// Simple frontmatter parser
+	const match = content.match(/^---\s*\n([\s\S]*?)\n---\s*\n([\s\S]*)$/);
+	if (!match) return undefined;
+
+	const frontmatter = match[1];
+	const body = match[2].trim();
+
+	const agent: Partial<AgentDefinition> = { body };
+
+	for (const line of frontmatter.split("\n")) {
+		const colonIdx = line.indexOf(":");
+		if (colonIdx === -1) continue;
+		const key = line.slice(0, colonIdx).trim();
+		const value = line.slice(colonIdx + 1).trim();
+
+		switch (key) {
+			case "name":
+				agent.name = value;
+				break;
+			case "description":
+				agent.description = value;
+				break;
+			case "model":
+				agent.model = value;
+				break;
+			case "tools":
+				agent.tools = value.split(",").map((t: string) => t.trim()).filter(Boolean);
+				break;
+		}
+	}
+
+	if (!agent.name) {
+		// Fallback to filename without extension
+		agent.name = filePath.split(/[\/]/).pop()?.replace(/\.md$/, "") ?? "unknown";
+	}
+
+	return agent as AgentDefinition;
+}
+
+function loadAgents(cwd: string): Map<string, AgentDefinition> {
+	const globalDir = join(getAgentDir(), "agents");
+	const projectDir = join(cwd, ".pi", "agents");
+
+	// Project agents override global agents with the same name
+	const agents = new Map<string, AgentDefinition>();
+
+	for (const file of findAgentFiles(globalDir)) {
+		const agent = parseAgentFile(file);
+		if (agent) agents.set(agent.name, agent);
+	}
+
+	for (const file of findAgentFiles(projectDir)) {
+		const agent = parseAgentFile(file);
+		if (agent) agents.set(agent.name, agent);
+	}
+
+	return agents;
+}
+
+function parseModelRef(ref: string): { provider: string; modelId: string } | undefined {
+	const slashIdx = ref.indexOf("/");
+	if (slashIdx === -1) return undefined;
+	return {
+		provider: ref.slice(0, slashIdx),
+		modelId: ref.slice(slashIdx + 1),
+	};
+}
+
+// ─── Extension ───────────────────────────────────────────────────────────────
+
+export default function agentModeExtension(pi: ExtensionAPI) {
+	let agents = new Map<string, AgentDefinition>();
+	let activeAgentName: string | undefined;
+	let activeAgent: AgentDefinition | undefined;
+	let originalState: OriginalState | undefined;
+
+	// Register --agent CLI flag
+	pi.registerFlag("agent", {
+		description: "Default agent to use at startup",
+		type: "string",
+	});
+
+	/**
+	 * Apply an agent configuration.
+	 */
+	async function applyAgent(name: string, agent: AgentDefinition, ctx: ExtensionContext): Promise<boolean> {
+		// Snapshot state before first agent is applied
+		if (activeAgentName === undefined) {
+			originalState = {
+				model: ctx.model,
+				tools: pi.getActiveTools(),
+			};
+		}
+
+		// Apply model if specified (format: provider/model-id)
+		if (agent.model) {
+			const ref = parseModelRef(agent.model);
+			if (ref) {
+				const model = ctx.modelRegistry.find(ref.provider, ref.modelId);
+				if (model) {
+					const success = await pi.setModel(model);
+					if (!success) {
+						ctx.ui.notify(`Agent "${name}": No API key for ${ref.provider}/${ref.modelId}`, "warning");
+					}
+				} else {
+					ctx.ui.notify(`Agent "${name}": Model ${ref.provider}/${ref.modelId} not found`, "warning");
+				}
+			} else {
+				ctx.ui.notify(`Agent "${name}": Invalid model format "${agent.model}" (expected provider/model-id)`, "warning");
+			}
+		}
+
+		// Apply tools if specified
+		if (agent.tools && agent.tools.length > 0) {
+			const allToolNames = pi.getAllTools().map((t) => t.name);
+			const validTools = agent.tools.filter((t) => allToolNames.includes(t));
+			const invalidTools = agent.tools.filter((t) => !allToolNames.includes(t));
+
+			if (invalidTools.length > 0) {
+				/* silently ignore unknown tools */
+			}
+
+			if (validTools.length > 0) {
+				pi.setActiveTools(validTools);
+			}
+		}
+
+		// Store active agent for system prompt injection
+		activeAgentName = name;
+		activeAgent = agent;
+
+		return true;
+	}
+
+	/**
+	 * Build description string for an agent.
+	 */
+	function buildAgentDescription(agent: AgentDefinition): string {
+		const parts: string[] = [];
+
+		if (agent.model) {
+			parts.push(agent.model);
+		}
+		if (agent.tools) {
+			parts.push(`tools:${agent.tools.join(",")}`);
+		}
+		if (agent.description) {
+			parts.push(agent.description);
+		}
+
+		return parts.join(" | ") || "No configuration";
+	}
+
+	/**
+	 * Show agent selector UI.
+	 */
+	async function showAgentSelector(ctx: ExtensionContext): Promise<void> {
+		const agentNames = Array.from(agents.keys()).sort();
+
+		if (agentNames.length === 0) {
+			ctx.ui.notify(
+				"No agents found. Create agent files in ~/.pi/agent/agents/ or .pi/agents/",
+				"warning",
+			);
+			return;
+		}
+
+		// Build select items with descriptions
+		const items: SelectItem[] = agentNames.map((name) => {
+			const agent = agents.get(name)!;
+			const isActive = name === activeAgentName;
+			return {
+				value: name,
+				label: isActive ? `${name} (active)` : name,
+				description: buildAgentDescription(agent),
+			};
+		});
+
+		// Add "None" option to clear agent
+		items.push({
+			value: "(none)",
+			label: "(none)",
+			description: "Clear active agent, restore defaults",
+		});
+
+		const result = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+			const container = new Container();
+			container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
+
+			// Header
+			container.addChild(new Text(theme.fg("accent", theme.bold("Select Agent"))));
+
+			// SelectList with themed styling
+			const selectList = new SelectList(items, Math.min(items.length, 10), {
+				selectedPrefix: (text: string) => theme.fg("accent", text),
+				selectedText: (text: string) => theme.fg("accent", text),
+				description: (text: string) => theme.fg("muted", text),
+				scrollInfo: (text: string) => theme.fg("dim", text),
+				noMatch: (text: string) => theme.fg("warning", text),
+			});
+
+			selectList.onSelect = (item) => done(item.value);
+			selectList.onCancel = () => done(null);
+
+			container.addChild(selectList);
+
+			// Footer hint
+			container.addChild(new Text(theme.fg("dim", "↑↓ navigate • enter select • esc cancel")));
+
+			container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
+
+			return {
+				render(width: number) {
+					return container.render(width);
+				},
+				invalidate() {
+					container.invalidate();
+				},
+				handleInput(data: string) {
+					selectList.handleInput(data);
+					tui.requestRender();
+				},
+			};
+		});
+
+		if (!result) return;
+
+		if (result === "(none)") {
+			// Clear agent and restore original state
+			activeAgentName = undefined;
+			activeAgent = undefined;
+			if (originalState) {
+				if (originalState.model) {
+					await pi.setModel(originalState.model);
+				}
+				pi.setActiveTools(originalState.tools);
+			}
+			ctx.ui.notify("Agent cleared, defaults restored", "info");
+			updateStatus(ctx);
+			return;
+		}
+
+		const agent = agents.get(result);
+		if (agent) {
+			await applyAgent(result, agent, ctx);
+			/* agent activated silently */
+			updateStatus(ctx);
+		}
+	}
+
+	/**
+	 * Update status indicator and widget.
+	 */
+	function updateStatus(ctx: ExtensionContext) {
+		if (activeAgentName && activeAgent) {
+			// Prominent widget above editor
+			const description = activeAgent.description
+				? ctx.ui.theme.fg("muted", ` — ${activeAgent.description}`)
+				: "";
+			const modelInfo = activeAgent.model
+				? ctx.ui.theme.fg("dim", ` [${activeAgent.model}]`)
+				: "";
+			const toolsInfo = activeAgent.tools
+				? ctx.ui.theme.fg("dim", ` {${activeAgent.tools.join(", ")}}`)
+				: "";
+
+			const banner =
+				ctx.ui.theme.fg("accent", "▸ ") +
+				ctx.ui.theme.bold(ctx.ui.theme.fg("accent", activeAgentName)) +
+				description +
+				modelInfo +
+				toolsInfo;
+
+			ctx.ui.setWidget("agent-mode-banner", [banner]);
+		} else {
+			// Show "ready" indicator when agents are available but none selected
+			const agentNames = Array.from(agents.keys()).sort();
+			if (agentNames.length > 0) {
+				const hint = ctx.ui.theme.fg("dim", "[No agent selected — type /agent or press Ctrl+Shift+M]");
+				ctx.ui.setWidget("agent-mode-banner", [hint]);
+			} else {
+				ctx.ui.setWidget("agent-mode-banner", undefined);
+			}
+		}
+	}
+
+	/**
+	 * Cycle to next agent.
+	 */
+	async function cycleAgent(ctx: ExtensionContext): Promise<void> {
+		const agentNames = Array.from(agents.keys()).sort();
+		if (agentNames.length === 0) {
+			ctx.ui.notify(
+				"No agents found. Create agent files in ~/.pi/agent/agents/ or .pi/agents/",
+				"warning",
+			);
+			return;
+		}
+
+		const cycleList = ["(none)", ...agentNames];
+		const currentName = activeAgentName ?? "(none)";
+		const currentIndex = cycleList.indexOf(currentName);
+		const nextIndex = currentIndex === -1 ? 0 : (currentIndex + 1) % cycleList.length;
+		const nextName = cycleList[nextIndex];
+
+		if (nextName === "(none)") {
+			activeAgentName = undefined;
+			activeAgent = undefined;
+			if (originalState) {
+				if (originalState.model) {
+					await pi.setModel(originalState.model);
+				}
+				pi.setActiveTools(originalState.tools);
+			}
+			ctx.ui.notify("Agent cleared, defaults restored", "info");
+			updateStatus(ctx);
+			return;
+		}
+
+		const agent = agents.get(nextName);
+		if (!agent) return;
+
+		await applyAgent(nextName, agent, ctx);
+		/* agent activated silently */
+		updateStatus(ctx);
+	}
+
+	// ─── Keyboard Shortcut ──────────────────────────────────────────────────────
+
+	// Use Ctrl+Shift+M to avoid conflict with pi-subagents (Ctrl+Shift+A)
+	pi.registerShortcut(Key.ctrlShift("m"), {
+		description: "Cycle agents",
+		handler: async (ctx) => {
+			await cycleAgent(ctx);
+		},
+	});
+
+	// ─── Commands ─────────────────────────────────────────────────────────────────
+
+	// Register /agent command
+	pi.registerCommand("agent", {
+		description: "Switch active agent",
+		handler: async (args, ctx) => {
+			// If agent name provided, apply directly
+			if (args?.trim()) {
+				const name = args.trim();
+
+				if (name === "(none)" || name === "none" || name === "clear") {
+					activeAgentName = undefined;
+					activeAgent = undefined;
+					if (originalState) {
+						if (originalState.model) {
+							await pi.setModel(originalState.model);
+						}
+						pi.setActiveTools(originalState.tools);
+					}
+					ctx.ui.notify("Agent cleared, defaults restored", "info");
+					updateStatus(ctx);
+					return;
+				}
+
+				const agent = agents.get(name);
+
+				if (!agent) {
+					const available = Array.from(agents.keys()).join(", ") || "(none defined)";
+					ctx.ui.notify(`Unknown agent "${name}". Available: ${available}`, "error");
+					return;
+				}
+
+				await applyAgent(name, agent, ctx);
+				/* agent activated silently */
+				updateStatus(ctx);
+				return;
+			}
+
+			// Otherwise show selector
+			await showAgentSelector(ctx);
+		},
+	});
+
+	// Register /agents command to list available agents
+	pi.registerCommand("agents", {
+		description: "List available agents",
+		handler: async (_args, ctx) => {
+			const agentNames = Array.from(agents.keys()).sort();
+			if (agentNames.length === 0) {
+				ctx.ui.notify(
+					"No agents found. Create agent files in ~/.pi/agent/agents/ or .pi/agents/",
+					"warning",
+				);
+				return;
+			}
+
+			const lines = agentNames.map((name) => {
+				const agent = agents.get(name)!;
+				const marker = name === activeAgentName ? "● " : "○ ";
+				const desc = agent.description ? ` - ${agent.description}` : "";
+				return `${marker}${name}${desc}`;
+			});
+
+			ctx.ui.notify(`Available agents:\n${lines.join("\n")}`, "info");
+		},
+	});
+
+	// ─── Tool Registration ──────────────────────────────────────────────────────
+
+	// Register set_agent tool for autonomous switching
+	pi.registerTool({
+		name: "set_agent",
+		label: "Set Agent",
+		description: "Switch to a different agent mode programmatically. Use this when the current task requires a different set of tools or specialized behavior.",
+		parameters: Type.Object({
+			agent: Type.String({ description: "Name of the agent to switch to" }),
+			reason: Type.Optional(Type.String({ description: "Reason for switching agents" })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const { agent: name, reason } = params;
+			const agent = agents.get(name);
+
+			if (!agent) {
+				const available = Array.from(agents.keys()).join(", ") || "(none defined)";
+				throw new Error(`Unknown agent "${name}". Available: ${available}`);
+			}
+
+			await applyAgent(name, agent, ctx);
+
+			const msg = reason
+				? `Switched to agent "${name}". Reason: ${reason}`
+				: `Switched to agent "${name}"`;
+
+			ctx.ui.notify(msg, "info");
+			updateStatus(ctx);
+
+			return {
+				content: [{ type: "text", text: msg }],
+				details: { agent: name, reason },
+			};
+		},
+	});
+
+	// ─── Event Handlers ─────────────────────────────────────────────────────────
+
+	// Inject agent instructions into system prompt
+	pi.on("before_agent_start", async (event) => {
+		if (activeAgent?.body) {
+			// Prepend agent body to system prompt (similar to OpenCode's agent instructions)
+			return {
+				systemPrompt: `${activeAgent.body}\n\n${event.systemPrompt}`,
+			};
+		}
+	});
+
+	// Initialize on session start
+	pi.on("session_start", async (event, ctx) => {
+		// Load agents from disk
+		agents = loadAgents(ctx.cwd);
+
+		const agentNames = Array.from(agents.keys()).sort();
+
+		// Silent startup — widget shows status
+
+		// Check for --agent flag first (highest priority)
+		const agentFlag = pi.getFlag("agent");
+		if (typeof agentFlag === "string" && agentFlag) {
+			const agent = agents.get(agentFlag);
+			if (agent) {
+				await applyAgent(agentFlag, agent, ctx);
+				/* agent activated silently */
+			} else {
+				const available = agentNames.join(", ") || "(none defined)";
+				/* silently ignore unknown agent flag */
+			}
+			updateStatus(ctx);
+			return;
+		}
+
+		// Try to restore from session state (if resuming)
+		if (event.reason === "resume" || event.reason === "fork") {
+			const entries = ctx.sessionManager.getEntries();
+			const agentEntry = entries
+				.filter((e: { type: string; customType?: string }) => e.type === "custom" && e.customType === "agent-state")
+				.pop() as { data?: { name: string } } | undefined;
+
+			if (agentEntry?.data?.name) {
+				const agent = agents.get(agentEntry.data.name);
+				if (agent) {
+					activeAgentName = agentEntry.data.name;
+					activeAgent = agent;
+					// Don't re-apply model/tools on restore, just keep the name for system prompt
+					/* agent restored silently */
+					updateStatus(ctx);
+					return;
+				}
+			}
+		}
+
+		// Try to load from settings (defaultAgent)
+		const settings = loadSettings(ctx.cwd);
+		if (settings.defaultAgent) {
+			const agent = agents.get(settings.defaultAgent);
+			if (agent) {
+				await applyAgent(settings.defaultAgent, agent, ctx);
+				/* agent activated silently */
+			} else {
+				/* silently ignore missing default agent */
+			}
+		}
+
+		// Show "no agent selected" indicator
+		updateStatus(ctx);
+	});
+
+	// Persist agent state on turn start
+	pi.on("turn_start", async () => {
+		if (activeAgentName) {
+			pi.appendEntry("agent-state", { name: activeAgentName });
+		}
+	});
+}

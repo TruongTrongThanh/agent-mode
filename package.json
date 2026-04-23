@@ -1,0 +1,27 @@
+{
+  "name": "pi-agent-mode",
+  "version": "1.0.0",
+  "description": "OpenCode-style default agent system for PI coding agent. Define agents as markdown files with YAML frontmatter, select a default agent, and process all prompts through it inline.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "coding-agent",
+    "agent-mode",
+    "opencode"
+  ],
+  "author": "ZGltYQ",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ZGltYQ/agent-mode.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ZGltYQ/agent-mode/issues"
+  },
+  "homepage": "https://github.com/ZGltYQ/agent-mode#readme",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
