@@ -26,7 +26,7 @@
  * - `/agent <name>` — Switch to agent directly
  * - `/agent-search <query>` — Search agents by name, description, or body
  * - `Ctrl+Shift+M` — Cycle through available agents
- * - `F2` — Search agents (opens query prompt)
+ * - `Ctrl+Shift+S` — Search agents (opens query prompt)
  * - Set default in `.pi/settings.json`: `{ "defaultAgent": "planner" }`
  * - Agent runs inline (same process) with full streaming visibility
  */
@@ -519,7 +519,7 @@ export default function agentModeExtension(pi: ExtensionAPI) {
 			// Show "ready" indicator when agents are available but none selected
 			const agentNames = Array.from(agents.keys()).sort();
 			if (agentNames.length > 0) {
-				const hint = ctx.ui.theme.fg("dim", "[No agent selected — /agent, Ctrl+Shift+M (cycle), F2 (search)]");
+				const hint = ctx.ui.theme.fg("dim", "[No agent selected — /agent, Ctrl+Shift+M (cycle), Ctrl+Shift+S (search)]");
 				ctx.ui.setWidget("agent-mode-banner", [hint]);
 			} else {
 				ctx.ui.setWidget("agent-mode-banner", undefined);
@@ -578,9 +578,8 @@ export default function agentModeExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	// F2: Search agents (function keys are unbound + terminal-reliable;
-	// Ctrl+F = cursor-right, Alt+F = word-right, so modifier+F collapses)
-	pi.registerShortcut("f2", {
+	// Ctrl+Shift+S: Search agents (same pattern as Ctrl+Shift+M cycle; unbound in defaults)
+	pi.registerShortcut(Key.ctrlShift("s"), {
 		description: "Search agents",
 		handler: async (ctx) => {
 			const query = await ctx.ui.input("Search agents:", "name, description, or content");
