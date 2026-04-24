@@ -8,10 +8,10 @@ Define agents as markdown files with YAML frontmatter, select a default agent, a
 
 - **Markdown agent definitions** — Simple YAML frontmatter + body
 - **Default agent at startup** — Set in `.pi/settings.json`
-- **Keyboard shortcuts** — `Ctrl+Shift+M` to cycle, `Ctrl+Shift+G` to search agents
+- **Keyboard shortcuts** — `Ctrl+Shift+M` to cycle, `Alt+S` to search agents
 - **Visual indicator** — Widget banner above editor shows active agent
 - **Model & tool restriction** — Per-agent model and tool sets
-- **Agent search** — `/agent-search <query>` or `Ctrl+Shift+G` to find agents by name, description, or body content
+- **Agent search** — `/agent-search <query>` or `Alt+S` to find agents by name, description, or body content
 - **Autonomous switching** — `set_agent` tool for LLM-driven switches
 - **Session persistence** — Active agent survives session resume
 
@@ -75,7 +75,7 @@ The markdown body after frontmatter becomes the agent's system prompt instructio
 ### Keyboard
 
 - `Ctrl+Shift+M` — Cycle through available agents
-- `Ctrl+Shift+G` — Search agents (opens query prompt, then shows ranked results)
+- `Alt+S` — Search agents (opens query prompt, then shows ranked results)
 
 ### CLI
 

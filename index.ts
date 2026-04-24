@@ -26,7 +26,7 @@
  * - `/agent <name>` — Switch to agent directly
  * - `/agent-search <query>` — Search agents by name, description, or body
  * - `Ctrl+Shift+M` — Cycle through available agents
- * - `Ctrl+Shift+G` — Search agents (opens query prompt)
+ * - `Alt+S` — Search agents (opens query prompt)
  * - Set default in `.pi/settings.json`: `{ "defaultAgent": "planner" }`
  * - Agent runs inline (same process) with full streaming visibility
  */
@@ -519,7 +519,7 @@ export default function agentModeExtension(pi: ExtensionAPI) {
 			// Show "ready" indicator when agents are available but none selected
 			const agentNames = Array.from(agents.keys()).sort();
 			if (agentNames.length > 0) {
-				const hint = ctx.ui.theme.fg("dim", "[No agent selected — /agent, Ctrl+Shift+M (cycle), Ctrl+Shift+G (search)]");
+				const hint = ctx.ui.theme.fg("dim", "[No agent selected — /agent, Ctrl+Shift+M (cycle), Alt+S (search)]");
 				ctx.ui.setWidget("agent-mode-banner", [hint]);
 			} else {
 				ctx.ui.setWidget("agent-mode-banner", undefined);
@@ -578,9 +578,9 @@ export default function agentModeExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	// Ctrl+Shift+G: Search agents (grep/find; avoids conflicts with pi-subagents ctrl+shift+a,
-	// pi-web-access ctrl+shift+s/w, and PI defaults ctrl+shift+p/o)
-	pi.registerShortcut(Key.ctrlShift("g"), {
+	// Alt+S: Search agents (Alt sends distinct ESC+letter sequence;
+	// terminals collapse Ctrl+Shift+<letter> -> Ctrl+<letter> when bound)
+	pi.registerShortcut("alt+s", {
 		description: "Search agents",
 		handler: async (ctx) => {
 			const query = await ctx.ui.input("Search agents:", "name, description, or content");
