@@ -1,7 +1,7 @@
 {
   "name": "pi-agent-mode",
-  "version": "1.1.2",
-  "description": "OpenCode-style default agent mode for PI. Define agents as markdown files with YAML frontmatter, select a default agent, search agents by content, and process all prompts inline with full streaming visibility.",
+  "version": "1.2.0",
+  "description": "OpenCode-style default agent mode for PI. Markdown agents with YAML frontmatter. Ctrl+Shift+M to cycle, Ctrl+Shift+F to search. Inline execution with full streaming visibility.",
   "keywords": [
     "pi-package",
     "pi",
