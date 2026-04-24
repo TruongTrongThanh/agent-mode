@@ -308,7 +308,10 @@ export default function agentModeExtension(pi: ExtensionAPI) {
 			}
 		}
 
-		// Apply tools if specified
+		// Apply tools if specified — MERGE with current active tools instead of
+		// replacing, so tools registered by other extensions (e.g. pi-mcp-adapter,
+		// pi-subagents) remain available. Base merge off originalState so switching
+		// between agents doesn't accumulate — each switch = original ∪ agent tools.
 		if (agent.tools && agent.tools.length > 0) {
 			const allToolNames = pi.getAllTools().map((t) => t.name);
 			const validTools = agent.tools.filter((t) => allToolNames.includes(t));
@@ -319,7 +322,9 @@ export default function agentModeExtension(pi: ExtensionAPI) {
 			}
 
 			if (validTools.length > 0) {
-				pi.setActiveTools(validTools);
+				const baseTools = originalState?.tools ?? pi.getActiveTools();
+				const merged = Array.from(new Set([...baseTools, ...validTools]));
+				pi.setActiveTools(merged);
 			}
 		}
 
