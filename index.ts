@@ -55,7 +55,13 @@ interface Settings {
 
 interface OriginalState {
 	model: Model<Api> | undefined;
-	tools: string[];
+	// Note: we deliberately do NOT snapshot active tools here. Tools registered
+	// asynchronously by other extensions (e.g. MCP servers) only show up in
+	// pi.getAllTools() after their connection settles, which usually happens
+	// AFTER session_start. Snapshotting at apply-time would lock those out.
+	// Instead, applyAgentTools() recomputes the active set from
+	// pi.getAllTools() each time, treating agent.tools as a whitelist for
+	// builtin tools only.
 }
 
 interface SearchResult {
@@ -279,14 +285,47 @@ export default function agentModeExtension(pi: ExtensionAPI) {
 	});
 
 	/**
+	 * Compute and apply the active tool set for the current agent.
+	 *
+	 * Semantics: agent.tools acts as a WHITELIST FOR BUILTIN TOOLS ONLY.
+	 * Tools registered by other extensions (sdk, MCP servers, subagents, etc.)
+	 * always remain active so the agent can reach them — the field's purpose is
+	 * to let an agent like "researcher" turn off `write`/`edit` (built-ins),
+	 * not to lock the LLM out of MCP-provided capabilities that connect
+	 * asynchronously.
+	 *
+	 * Called from applyAgent and from before_agent_start, so tools registered
+	 * after the agent was applied (e.g. an MCP server that takes a few seconds
+	 * to connect) get folded into the active set on the next turn.
+	 */
+	function applyAgentTools(): void {
+		if (!activeAgent?.tools?.length) return;
+
+		// Normalize the whitelist for case-insensitive comparison.
+		const whitelist = new Set(activeAgent.tools.map((t) => t.toLowerCase()));
+
+		const all = pi.getAllTools();
+		const merged = all
+			.filter((t) => {
+				const src = t.sourceInfo?.source;
+				// Pass through anything not flagged as builtin (sdk, extension, MCP).
+				if (src !== "builtin") return true;
+				return whitelist.has(t.name.toLowerCase());
+			})
+			.map((t) => t.name);
+
+		pi.setActiveTools(merged);
+	}
+
+	/**
 	 * Apply an agent configuration.
 	 */
 	async function applyAgent(name: string, agent: AgentDefinition, ctx: ExtensionContext): Promise<boolean> {
-		// Snapshot state before first agent is applied
+		// Snapshot only the model on first apply, so /agent clear can restore it.
+		// We deliberately don't snapshot tools — see comment on OriginalState.
 		if (activeAgentName === undefined) {
 			originalState = {
 				model: ctx.model,
-				tools: pi.getActiveTools(),
 			};
 		}
 
@@ -308,31 +347,21 @@ export default function agentModeExtension(pi: ExtensionAPI) {
 			}
 		}
 
-		// Apply tools if specified — MERGE with current active tools instead of
-		// replacing, so tools registered by other extensions (e.g. pi-mcp-adapter,
-		// pi-subagents) remain available. Base merge off originalState so switching
-		// between agents doesn't accumulate — each switch = original ∪ agent tools.
-		if (agent.tools && agent.tools.length > 0) {
-			const allToolNames = pi.getAllTools().map((t) => t.name);
-			const validTools = agent.tools.filter((t) => allToolNames.includes(t));
-			const invalidTools = agent.tools.filter((t) => !allToolNames.includes(t));
-
-			if (invalidTools.length > 0) {
-				/* silently ignore unknown tools */
-			}
-
-			if (validTools.length > 0) {
-				const baseTools = originalState?.tools ?? pi.getActiveTools();
-				const merged = Array.from(new Set([...baseTools, ...validTools]));
-				pi.setActiveTools(merged);
-			}
-		}
-
-		// Store active agent for system prompt injection
+		// Store active agent BEFORE applying tools so applyAgentTools can read it.
 		activeAgentName = name;
 		activeAgent = agent;
 
+		applyAgentTools();
+
 		return true;
+	}
+
+	/**
+	 * Restore the default tool set: enable everything that's currently registered.
+	 * Called when the active agent is cleared.
+	 */
+	function restoreAllTools(): void {
+		pi.setActiveTools(pi.getAllTools().map((t) => t.name));
 	}
 
 	/**
@@ -413,12 +442,10 @@ export default function agentModeExtension(pi: ExtensionAPI) {
 		if (result === "(none)") {
 			activeAgentName = undefined;
 			activeAgent = undefined;
-			if (originalState) {
-				if (originalState.model) {
-					await pi.setModel(originalState.model);
-				}
-				pi.setActiveTools(originalState.tools);
+			if (originalState?.model) {
+				await pi.setModel(originalState.model);
 			}
+			restoreAllTools();
 			ctx.ui.notify("Agent cleared, defaults restored", "info");
 			updateStatus(ctx);
 			return;
@@ -554,12 +581,10 @@ export default function agentModeExtension(pi: ExtensionAPI) {
 		if (nextName === "(none)") {
 			activeAgentName = undefined;
 			activeAgent = undefined;
-			if (originalState) {
-				if (originalState.model) {
-					await pi.setModel(originalState.model);
-				}
-				pi.setActiveTools(originalState.tools);
+			if (originalState?.model) {
+				await pi.setModel(originalState.model);
 			}
+			restoreAllTools();
 			ctx.ui.notify("Agent cleared, defaults restored", "info");
 			updateStatus(ctx);
 			return;
@@ -608,12 +633,10 @@ export default function agentModeExtension(pi: ExtensionAPI) {
 				if (name === "(none)" || name === "none" || name === "clear") {
 					activeAgentName = undefined;
 					activeAgent = undefined;
-					if (originalState) {
-						if (originalState.model) {
-							await pi.setModel(originalState.model);
-						}
-						pi.setActiveTools(originalState.tools);
+					if (originalState?.model) {
+						await pi.setModel(originalState.model);
 					}
+					restoreAllTools();
 					ctx.ui.notify("Agent cleared, defaults restored", "info");
 					updateStatus(ctx);
 					return;
@@ -771,9 +794,17 @@ export default function agentModeExtension(pi: ExtensionAPI) {
 
 	// ─── Event Handlers ─────────────────────────────────────────────────────────
 
-	// Inject agent instructions into system prompt
+	// Inject agent instructions into system prompt and refresh tool whitelist.
 	pi.on("before_agent_start", async (event) => {
-		if (activeAgent?.body) {
+		if (!activeAgent) return;
+
+		// Re-evaluate the active tool set against the *current* registry. Tools
+		// registered by other extensions after the agent was applied (e.g. MCP
+		// servers that connect asynchronously) only become visible here — doing
+		// this once at apply-time would miss them and lock the LLM out of MCP.
+		applyAgentTools();
+
+		if (activeAgent.body) {
 			// Prepend agent body to system prompt (similar to OpenCode's agent instructions)
 			return {
 				systemPrompt: `${activeAgent.body}\n\n${event.systemPrompt}`,
@@ -786,8 +817,6 @@ export default function agentModeExtension(pi: ExtensionAPI) {
 		// Load agents from disk
 		agents = loadAgents(ctx.cwd);
 
-		const agentNames = Array.from(agents.keys()).sort();
-
 		// Silent startup — widget shows status
 
 		// Check for --agent flag first (highest priority)
@@ -797,10 +826,8 @@ export default function agentModeExtension(pi: ExtensionAPI) {
 			if (agent) {
 				await applyAgent(agentFlag, agent, ctx);
 				/* agent activated silently */
-			} else {
-				const available = agentNames.join(", ") || "(none defined)";
-				/* silently ignore unknown agent flag */
 			}
+			/* unknown --agent value silently ignored */
 			updateStatus(ctx);
 			return;
 		}
@@ -817,8 +844,10 @@ export default function agentModeExtension(pi: ExtensionAPI) {
 				if (agent) {
 					activeAgentName = agentEntry.data.name;
 					activeAgent = agent;
-					// Don't re-apply model/tools on restore, just keep the name for system prompt
-					/* agent restored silently */
+					// Re-apply tool whitelist on resume so the same restrictions take
+					// effect as a fresh apply. Model is intentionally not re-applied
+					// to preserve any explicit user override across the resume.
+					applyAgentTools();
 					updateStatus(ctx);
 					return;
 				}
@@ -841,10 +870,14 @@ export default function agentModeExtension(pi: ExtensionAPI) {
 		updateStatus(ctx);
 	});
 
-	// Persist agent state on turn start
+	// Persist agent state on turn start — only when it actually changed since
+	// the last persisted entry. The previous unconditional append produced one
+	// session entry per turn even when the agent was unchanged for hours.
+	let lastPersistedAgentName: string | undefined;
 	pi.on("turn_start", async () => {
-		if (activeAgentName) {
+		if (activeAgentName && activeAgentName !== lastPersistedAgentName) {
 			pi.appendEntry("agent-state", { name: activeAgentName });
+			lastPersistedAgentName = activeAgentName;
 		}
 	});
 }
