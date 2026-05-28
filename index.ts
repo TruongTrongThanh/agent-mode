@@ -25,7 +25,7 @@
  * - `/agent` — Show selector to switch agents
  * - `/agent <name>` — Switch to agent directly
  * - `/agent-search <query>` — Search agents by name, description, or body
- * - `Ctrl+Shift+M` — Cycle through available agents
+ * - `Alt+A` — Cycle through available agents
  * - `Alt+S` — Search agents (opens query prompt)
  * - Set default in `.pi/settings.json`: `{ "defaultAgent": "planner" }`
  * - Agent runs inline (same process) with full streaming visibility
@@ -33,10 +33,10 @@
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { Api, Model } from "@mariozechner/pi-ai";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { DynamicBorder, getAgentDir } from "@mariozechner/pi-coding-agent";
-import { Container, Key, type SelectItem, SelectList, Text } from "@mariozechner/pi-tui";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { Container, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -55,13 +55,10 @@ interface Settings {
 
 interface OriginalState {
 	model: Model<Api> | undefined;
-	// Note: we deliberately do NOT snapshot active tools here. Tools registered
-	// asynchronously by other extensions (e.g. MCP servers) only show up in
-	// pi.getAllTools() after their connection settles, which usually happens
-	// AFTER session_start. Snapshotting at apply-time would lock those out.
-	// Instead, applyAgentTools() recomputes the active set from
-	// pi.getAllTools() each time, treating agent.tools as a whitelist for
-	// builtin tools only.
+	// Note: we deliberately do NOT snapshot active tools here. Instead,
+	// applyAgentTools() recomputes the active set from pi.getAllTools() each
+	// time, treating agent.tools as an absolute whitelist for all tools
+	// (builtin, extension, MCP, etc.).
 }
 
 interface SearchResult {
@@ -287,16 +284,15 @@ export default function agentModeExtension(pi: ExtensionAPI) {
 	/**
 	 * Compute and apply the active tool set for the current agent.
 	 *
-	 * Semantics: agent.tools acts as a WHITELIST FOR BUILTIN TOOLS ONLY.
-	 * Tools registered by other extensions (sdk, MCP servers, subagents, etc.)
-	 * always remain active so the agent can reach them — the field's purpose is
-	 * to let an agent like "researcher" turn off `write`/`edit` (built-ins),
-	 * not to lock the LLM out of MCP-provided capabilities that connect
-	 * asynchronously.
+	 * Semantics: agent.tools acts as an ABSOLUTE WHITELIST for ALL tools.
+	 * Only tools whose names appear in the agent's tools list are activated,
+	 * regardless of source (builtin, sdk, extension, MCP, etc.). This gives
+	 * agents full control over which capabilities they can use.
 	 *
 	 * Called from applyAgent and from before_agent_start, so tools registered
 	 * after the agent was applied (e.g. an MCP server that takes a few seconds
-	 * to connect) get folded into the active set on the next turn.
+	 * to connect) get folded into the active set on the next turn if they
+	 * match the whitelist.
 	 */
 	function applyAgentTools(): void {
 		if (!activeAgent?.tools?.length) return;
@@ -306,12 +302,7 @@ export default function agentModeExtension(pi: ExtensionAPI) {
 
 		const all = pi.getAllTools();
 		const merged = all
-			.filter((t) => {
-				const src = t.sourceInfo?.source;
-				// Pass through anything not flagged as builtin (sdk, extension, MCP).
-				if (src !== "builtin") return true;
-				return whitelist.has(t.name.toLowerCase());
-			})
+			.filter((t) => whitelist.has(t.name.toLowerCase()))
 			.map((t) => t.name);
 
 		pi.setActiveTools(merged);
@@ -551,7 +542,7 @@ export default function agentModeExtension(pi: ExtensionAPI) {
 			// Show "ready" indicator when agents are available but none selected
 			const agentNames = Array.from(agents.keys()).sort();
 			if (agentNames.length > 0) {
-				const hint = ctx.ui.theme.fg("dim", "[No agent selected — /agent, Ctrl+Shift+M (cycle), Alt+S (search)]");
+				const hint = ctx.ui.theme.fg("dim", "[No agent selected — /agent, Alt+A (cycle), Alt+S (search)]");
 				ctx.ui.setWidget("agent-mode-banner", [hint]);
 			} else {
 				ctx.ui.setWidget("agent-mode-banner", undefined);
@@ -600,8 +591,8 @@ export default function agentModeExtension(pi: ExtensionAPI) {
 
 	// ─── Keyboard Shortcut ──────────────────────────────────────────────────────
 
-	// Use Ctrl+Shift+M to avoid conflict with pi-subagents (Ctrl+Shift+A)
-	pi.registerShortcut(Key.ctrlShift("m"), {
+	// Alt+A: Cycle agents
+	pi.registerShortcut("alt+a", {
 		description: "Cycle agents",
 		handler: async (ctx) => {
 			await cycleAgent(ctx);
